@@ -1,25 +1,27 @@
 #!/bin/bash
 set -e
 
-# mvclaude — move a project directory AND its Claude Code (CLI) context with it.
+# mvclaude — move a project folder and everything Claude knows about it.
 #
 # Usage:
-#   mvclaude <old_directory> <new_directory>
-#   mvclaude --resume <old_directory> <new_directory>
+#   mvclaude [-y] <old_directory> <new_directory>
 #
-# --resume finishes a move that stopped part way (for example a cross-volume
-# copy whose source could not be deleted). It copies whatever is still in
-# <old> into <new>, removes <old>, then moves the Claude context and rewrites
-# references. If <old> is already gone it only does the context/reference part.
-# Every step is idempotent, so re-running --resume is always safe.
+# It looks at what exists and does only what is needed:
 #
-# What Claude Code keys off the project path:
-#   ~/.claude/projects/<encoded-path>/   session transcripts (*.jsonl)
-#   ~/.claude.json  -> "projects" object keyed by the ABSOLUTE path
-#                      (trust, allowed tools, per-project MCP servers)
-#   ~/.claude/history.jsonl              global prompt history (contains cwd)
+#   folder       move it (atomic rename on the same volume, rsync across
+#                volumes), finish a move that stopped part way, or nothing
+#                if it is already at the new path
+#   Claude Code  ~/.claude/{projects,file-history,todos,shell-snapshots,debug}/<enc>
+#                ~/.claude.json "projects" entry, ~/.claude/history.jsonl
+#   Cowork       Claude desktop app: folder consents, spaces, session folders
+#                (only if Cowork data exists and references the old path)
 #
-# Encoding rule (verified in claude v2.1.251):
+# Every step is idempotent: re-running after a failure is always safe.
+#
+#   -y / --yes   do not ask before continuing into an existing destination
+#                that does not obviously look like a partial move
+#
+# Claude Code path encoding (verified in claude v2.1.251):
 #   every non-alphanumeric character becomes "-"   [^a-zA-Z0-9] -> -
 #
 # Cross-volume moves: BSD `mv` copies, then `rm -rf`s the source, and fails
@@ -27,24 +29,27 @@ set -e
 # source during the copy. We use `rsync --remove-source-files` instead, then
 # sweep junk files and empty directories. Hard links are preserved (-H).
 # macOS extended attributes are not (openrsync's -E is unreliable).
+#
+# Backups: ~/.claude/history.jsonl.bak-<stamp>, ~/.claude.json.bak-<stamp>,
+#          ~/.mvclaude-backups/<stamp>/ (Cowork files)
 
 usage() {
-    echo "Usage: mvclaude [--resume] <old_directory> <new_directory>"
+    echo "Usage: mvclaude [-y] <old_directory> <new_directory>"
     echo "Example: mvclaude ~/old-project ~/new-project"
-    echo "         mvclaude --resume ~/old-project ~/new-project   # finish a partial move"
     exit 1
 }
 
-RESUME=0
+YES=0
 case "$1" in
-    --resume|--refs-only) RESUME=1; shift ;;
-    --*) usage ;;
+    -y|--yes|--resume|--refs-only) YES=1; shift ;;   # old flags still accepted
+    -*) usage ;;
 esac
 [ $# -eq 2 ] || usage
 
 OLD_DIR="$1"
 NEW_DIR="$2"
 CLAUDE_DIR="$HOME/.claude"
+COWORK_DIR="${MVCLAUDE_COWORK_DIR:-${MVCOWORK_APP_DIR:-$HOME/Library/Application Support/Claude}}"
 
 # --- Helpers ------------------------------------------------------------------
 
@@ -53,9 +58,7 @@ CLAUDE_DIR="$HOME/.claude"
 canon()   { (cd "$1" 2>/dev/null && python3 -c 'import os; print(os.getcwd())'); }
 abspath() { python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
 same_device() { [ "$(stat -f %d "$1")" = "$(stat -f %d "$2")" ]; }
-
-# Correct encoding: ALL non-alphanumerics -> "-" (not just "/" and ".")
-encode() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+encode()  { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
 
 # Delete junk files and empty dirs left in a copied-out source tree.
 # Fails (listing leftovers) if anything real remains.
@@ -67,7 +70,7 @@ sweep_source() {
     if [ -e "$src" ]; then
         echo "Error: source still has content that was not moved:"
         find "$src" -mindepth 1 -not -type d | head -20
-        echo "Fix the above (permissions? files still open?) then re-run with --resume."
+        echo "Fix the above (permissions? files still open?) then re-run mvclaude."
         return 1
     fi
 }
@@ -81,32 +84,22 @@ move_tree() {
         mv "$src" "$dst"
         return
     fi
-    echo "  (different volume or resuming: copying with rsync)"
     rsync -aH --remove-source-files "$src/" "$dst/"
     sweep_source "$src"
 }
 
-# --- Validate everything BEFORE touching anything -----------------------------
+# --- Resolve paths ------------------------------------------------------------
 
 OLD_EXISTS=0
 if [ -d "$OLD_DIR" ]; then
     OLD_ABS=$(canon "$OLD_DIR")
     OLD_EXISTS=1
-elif [ "$RESUME" -eq 1 ]; then
-    OLD_ABS=$(abspath "$OLD_DIR")
 else
-    echo "Error: old directory does not exist: $OLD_DIR"
-    echo "(already moved it? use: mvclaude --resume <old> <new>)"
-    exit 1
+    OLD_ABS=$(abspath "$OLD_DIR")
 fi
 
 NEW_EXISTS=0
 if [ -e "$NEW_DIR" ]; then
-    if [ "$RESUME" -ne 1 ]; then
-        echo "Error: destination already exists: $NEW_DIR"
-        echo "(did a previous move stop part way? use: mvclaude --resume <old> <new>)"
-        exit 1
-    fi
     if [ ! -d "$NEW_DIR" ]; then
         echo "Error: destination exists and is not a directory: $NEW_DIR"
         exit 1
@@ -127,7 +120,9 @@ else
 fi
 
 if [ "$OLD_EXISTS" -eq 0 ] && [ "$NEW_EXISTS" -eq 0 ]; then
-    echo "Error: neither old nor new directory exists; nothing to resume."
+    echo "Error: neither old nor new directory exists:"
+    echo "  $OLD_ABS"
+    echo "  $NEW_ABS"
     exit 1
 fi
 if [ "$OLD_ABS" = "$NEW_ABS" ]; then
@@ -168,21 +163,189 @@ if [ ${#OLD_ENCODED} -gt 200 ] || [ ${#NEW_ENCODED} -gt 200 ]; then
     exit 1
 fi
 
-# --- Check for context conflicts at the destination --------------------------
-# Only a conflict when BOTH old and new context exist for the same subdir.
+# --- Reference scanner / rewriter (one program, two modes) --------------------
+# scan : print KEY=N lines describing what references the old path
+# apply: rewrite references (session files under NEW_ENCODED, history,
+#        ~/.claude.json, Cowork files) with backups
 
-SUBDIRS="projects file-history todos shell-snapshots debug"
+refs() {
+    python3 - "$1" "$OLD_ABS" "$NEW_ABS" "$CLAUDE_DIR" "$OLD_ENCODED" "$NEW_ENCODED" "$COWORK_DIR" <<'PYEOF'
+import json, re, shutil, sys, time
+from pathlib import Path
 
-EXISTING_CONTEXT=""
-for subdir in $SUBDIRS; do
-    if [ -e "$CLAUDE_DIR/$subdir/$OLD_ENCODED" ] && [ -e "$CLAUDE_DIR/$subdir/$NEW_ENCODED" ]; then
-        EXISTING_CONTEXT="$EXISTING_CONTEXT $subdir"
+mode, old, new, claude_dir, old_enc, new_enc, cowork_dir = sys.argv[1:8]
+claude_dir, cowork_dir = Path(claude_dir), Path(cowork_dir)
+stamp = time.strftime("%Y%m%d-%H%M%S")
+
+# Replace old path only when NOT followed by [A-Za-z0-9_.-], so moving
+# /a/b never rewrites /a/b2, /a/b_x, or /a/b.bak ( /a/b/sub still matches ).
+pat = re.compile(re.escape(old) + r'(?![A-Za-z0-9_.-])')
+
+def read(p):  return p.read_text(errors="surrogateescape")
+def hits(p):  return len(pat.findall(read(p))) if p.is_file() else 0
+def rewrite(p):
+    s = read(p); s2 = pat.sub(lambda m: new, s)
+    if s2 != s:
+        p.write_text(s2, errors="surrogateescape"); return 1
+    return 0
+
+SUBDIRS = ["projects", "file-history", "todos", "shell-snapshots", "debug"]
+hist = claude_dir / "history.jsonl"
+cfg = Path.home() / ".claude.json"
+
+def cowork_targets():
+    lam = cowork_dir / "local-agent-mode-sessions"
+    if not lam.is_dir():
+        return None
+    t = [cowork_dir / "claude_desktop_config.json"]
+    for user_dir in lam.glob("*/*"):
+        if user_dir.is_dir():
+            t += sorted(user_dir.glob("local_*.json"))
+            t += [user_dir / n for n in ("spaces.json", "spaces.json.bak", "remote-session-spaces.json")]
+    return [f for f in t if f.is_file()]
+
+if mode == "scan":
+    ctx = [d for d in SUBDIRS if (claude_dir / d / old_enc).exists()]
+    print(f"CLAUDE_CTX={len(ctx)}")
+    print(f"CLAUDE_CTX_NAMES='{' '.join(ctx)}'")
+    print(f"CLAUDE_HIST={hits(hist)}")
+    has_cfg = 0
+    if cfg.is_file():
+        try: has_cfg = int(old in json.loads(read(cfg)).get("projects", {}))
+        except Exception: has_cfg = 0
+    print(f"CLAUDE_CFG={has_cfg}")
+    ct = cowork_targets()
+    print(f"COWORK_INSTALLED={int(ct is not None)}")
+    print(f"COWORK_REFS={sum(1 for f in (ct or []) if hits(f))}")
+    sys.exit(0)
+
+# ---- apply ----
+proj = claude_dir / "projects" / new_enc
+n = sum(rewrite(f) for f in proj.rglob("*.jsonl")) if proj.is_dir() else 0
+print(f"  session files updated: {n}")
+
+if hist.is_file():
+    bak = hist.with_name(f"history.jsonl.bak-{stamp}")
+    shutil.copy2(hist, bak)
+    if rewrite(hist): print("  history.jsonl updated (backup kept)")
+    else: bak.unlink()
+
+if cfg.is_file():
+    data = json.loads(read(cfg))
+    projects = data.get("projects", {})
+    if old in projects:
+        shutil.copy2(cfg, cfg.with_name(f".claude.json.bak-{stamp}"))
+        entry = projects.pop(old)
+        if new in projects:
+            entry.update(projects[new])   # existing destination entry wins
+        projects[new] = entry
+        cfg.write_text(json.dumps(data, indent=2))
+        print("  ~/.claude.json project entry moved (backup kept)")
+
+ct = cowork_targets() or []
+backup_root = Path.home() / ".mvclaude-backups" / stamp
+changed = 0
+for f in ct:
+    s = read(f); s2 = pat.sub(lambda m: new, s)
+    if s2 != s:
+        bak = backup_root / f.relative_to(cowork_dir)
+        bak.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, bak)
+        f.write_text(s2, errors="surrogateescape")
+        changed += 1
+        print(f"  cowork: updated {f.relative_to(cowork_dir)}")
+if changed:
+    print(f"  cowork: {changed} file(s) updated; backups in {backup_root}")
+PYEOF
+}
+
+# --- Detect what is needed ----------------------------------------------------
+
+eval "$(refs scan)"
+
+if [ "$OLD_EXISTS" -eq 1 ] && [ "$NEW_EXISTS" -eq 0 ]; then
+    FOLDER=move
+    if same_device "$OLD_ABS" "$(dirname "$NEW_ABS")"; then
+        FOLDER_DESC="move (same volume, rename)"
+    else
+        FOLDER_DESC="move (different volume, rsync copy then remove)"
     fi
-done
+elif [ "$OLD_EXISTS" -eq 1 ]; then
+    FOLDER=resume
+    # Obvious partial move: old holds nothing real, or everything at its top
+    # level already exists in new. Anything else needs a yes.
+    LOOKS_PARTIAL=$(python3 - "$OLD_ABS" "$NEW_ABS" <<'PYEOF'
+import os, sys
+old, new = sys.argv[1:3]
+top = os.listdir(old)
+if all(os.path.lexists(os.path.join(new, e)) for e in top):
+    print(1); sys.exit()
+for root, dirs, files in os.walk(old):
+    if any(f != ".DS_Store" for f in files):
+        print(0); sys.exit()
+print(1)
+PYEOF
+)
+    LEFT=$(find "$OLD_ABS" -not -type d -not -name .DS_Store | wc -l | tr -d ' ')
+    FOLDER_DESC="finish partial move ($LEFT item(s) still in old)"
+else
+    FOLDER=none
+    FOLDER_DESC="already moved"
+fi
 
-if [ -n "$EXISTING_CONTEXT" ]; then
+if [ "$CLAUDE_CTX" -gt 0 ] || [ "$CLAUDE_CFG" -eq 1 ] || [ "$CLAUDE_HIST" -gt 0 ]; then
+    CLAUDE_DESC="context: ${CLAUDE_CTX_NAMES:-none}; ~/.claude.json entry: $([ "$CLAUDE_CFG" -eq 1 ] && echo yes || echo no); history lines: $CLAUDE_HIST"
+else
+    CLAUDE_DESC="nothing references the old path"
+fi
+
+if [ "$COWORK_INSTALLED" -eq 0 ]; then
+    COWORK_DESC="not installed"
+elif [ "$COWORK_REFS" -gt 0 ]; then
+    COWORK_DESC="$COWORK_REFS file(s) reference the old path"
+else
+    COWORK_DESC="nothing references the old path"
+fi
+
+echo "mvclaude: $OLD_ABS"
+echo "       -> $NEW_ABS"
+echo "  folder       $FOLDER_DESC"
+echo "  claude code  $CLAUDE_DESC"
+echo "  cowork       $COWORK_DESC"
+echo ""
+
+if [ "$FOLDER" = none ] && [ "$CLAUDE_CTX" -eq 0 ] && [ "$CLAUDE_CFG" -eq 0 ] \
+   && [ "$CLAUDE_HIST" -eq 0 ] && [ "$COWORK_REFS" -eq 0 ]; then
+    echo "Nothing to do."
+    exit 0
+fi
+
+# --- Pre-flight checks (before touching anything) -----------------------------
+
+if [ "$COWORK_REFS" -gt 0 ] && pgrep -xq "Claude" 2>/dev/null; then
+    echo "Error: Cowork references need updating; quit the Claude desktop app first."
+    exit 1
+fi
+
+if [ "$FOLDER" = resume ] && [ "$LOOKS_PARTIAL" != 1 ] && [ "$YES" -ne 1 ]; then
+    echo "Destination already exists and does not look like a partial copy of the source."
+    if [ -t 0 ]; then
+        read -p "Merge the old directory into it anyway? [y/N]: " -n 1 -r; echo
+        [[ $REPLY =~ ^[Yy]$ ]] || { echo "Aborted."; exit 1; }
+    else
+        echo "Re-run with -y to merge anyway."
+        exit 1
+    fi
+fi
+
+# Context conflict: BOTH old and new Claude context exist for the same subdir.
+CONFLICTS=""
+for subdir in $CLAUDE_CTX_NAMES; do
+    [ -e "$CLAUDE_DIR/$subdir/$NEW_ENCODED" ] && CONFLICTS="$CONFLICTS $subdir"
+done
+if [ -n "$CONFLICTS" ]; then
     echo "Warning: Claude context already exists for $NEW_ABS:"
-    for item in $EXISTING_CONTEXT; do
+    for item in $CONFLICTS; do
         COUNT=""
         if [ "$item" = "projects" ] && [ -d "$CLAUDE_DIR/$item/$NEW_ENCODED" ]; then
             SESSION_COUNT=$(find "$CLAUDE_DIR/$item/$NEW_ENCODED" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
@@ -196,123 +359,53 @@ if [ -n "$EXISTING_CONTEXT" ]; then
     echo "  [m] Merge old context into existing context"
     echo "  [n] Abort (default)"
     echo ""
-    read -p "Choose [c/m/N]: " -n 1 -r
-    echo
+    if [ -t 0 ]; then
+        read -p "Choose [c/m/N]: " -n 1 -r; echo
+    else
+        REPLY=$([ "$YES" -eq 1 ] && echo m || echo n)
+    fi
     if [[ $REPLY =~ ^[Cc]$ ]]; then
-        for item in $EXISTING_CONTEXT; do
+        for item in $CONFLICTS; do
             rm -rf "$CLAUDE_DIR/$item/$NEW_ENCODED"
             echo "  removed $item"
         done
     elif [[ $REPLY =~ ^[Mm]$ ]]; then
         echo "Will merge contexts..."
     else
-        echo "Aborted."
+        echo "Aborted. (non-interactive: pass -y to merge)"
         exit 1
     fi
     echo ""
 fi
 
-# --- 1. Move the real directory FIRST (most likely thing to fail) -------------
+# --- 1. Folder (most likely thing to fail, so first) --------------------------
 
-if [ "$OLD_EXISTS" -eq 1 ]; then
-    if [ "$NEW_EXISTS" -eq 1 ]; then
-        echo "Resuming move (copying what is still in the old directory):"
-    else
-        echo "Moving directory:"
-    fi
-    echo "  $OLD_ABS"
-    echo "  -> $NEW_ABS"
-    move_tree "$OLD_ABS" "$NEW_ABS"
-else
-    echo "Directory already moved; updating Claude context and references only."
-fi
-echo ""
+case "$FOLDER" in
+    move)   echo "Moving folder..."; move_tree "$OLD_ABS" "$NEW_ABS" ;;
+    resume) echo "Finishing partial move..."; move_tree "$OLD_ABS" "$NEW_ABS" ;;
+esac
 
-# --- 2. Move / merge the context directories ----------------------------------
+# --- 2. Claude Code context directories ---------------------------------------
 
-MOVED=0
-for subdir in $SUBDIRS; do
+for subdir in $CLAUDE_CTX_NAMES; do
     OLD_PATH="$CLAUDE_DIR/$subdir/$OLD_ENCODED"
     NEW_PATH="$CLAUDE_DIR/$subdir/$NEW_ENCODED"
-    if [ -d "$OLD_PATH" ]; then
-        if [ -d "$NEW_PATH" ]; then
-            echo "Merging $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
-            # find, not glob: also moves dotfiles
-            find "$OLD_PATH" -mindepth 1 -maxdepth 1 -exec mv {} "$NEW_PATH/" \;
-            rmdir "$OLD_PATH" 2>/dev/null || rm -rf "$OLD_PATH"
-        else
-            echo "Moving $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
-            mv "$OLD_PATH" "$NEW_PATH"
-        fi
-        MOVED=$((MOVED + 1))
-    elif [ -f "$OLD_PATH" ]; then
+    if [ -d "$OLD_PATH" ] && [ -d "$NEW_PATH" ]; then
+        echo "Merging $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
+        find "$OLD_PATH" -mindepth 1 -maxdepth 1 -exec mv {} "$NEW_PATH/" \;   # find, not glob: dotfiles too
+        rmdir "$OLD_PATH" 2>/dev/null || rm -rf "$OLD_PATH"
+    else
         echo "Moving $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
         mv "$OLD_PATH" "$NEW_PATH"
-        MOVED=$((MOVED + 1))
     fi
 done
 
-if [ "$MOVED" -eq 0 ]; then
-    echo "No Claude context found for $OLD_ABS"
-else
-    echo "Moved $MOVED context location(s)"
-fi
-echo ""
+# --- 3. References (Claude Code + Cowork) -------------------------------------
 
-# --- 3. Rewrite path references (python: safe with any characters) ------------
-# Replaces OLD_ABS only when NOT followed by [A-Za-z0-9_.-], so moving
-# /a/b never rewrites /a/b2, /a/b_x, or /a/b.bak ( /a/b/sub still matches ).
-# Idempotent: a second run finds nothing to change.
-
-echo "Updating path references..."
-python3 - "$OLD_ABS" "$NEW_ABS" "$CLAUDE_DIR" "$NEW_ENCODED" <<'PYEOF'
-import json, re, shutil, sys, time
-from pathlib import Path
-
-old, new, claude_dir, new_encoded = sys.argv[1:5]
-claude_dir = Path(claude_dir)
-stamp = time.strftime("%Y%m%d-%H%M%S")
-pat = re.compile(re.escape(old) + r'(?![A-Za-z0-9_.-])')
-
-def rewrite(p):
-    s = p.read_text(errors="surrogateescape")
-    s2 = pat.sub(lambda m: new, s)
-    if s2 != s:
-        p.write_text(s2, errors="surrogateescape")
-        return 1
-    return 0
-
-# Session transcripts
-proj = claude_dir / "projects" / new_encoded
-n = sum(rewrite(f) for f in proj.rglob("*.jsonl")) if proj.is_dir() else 0
-print(f"  session files updated: {n}")
-
-# Global history
-hist = claude_dir / "history.jsonl"
-if hist.is_file():
-    bak = hist.with_name(f"history.jsonl.bak-{stamp}")
-    shutil.copy2(hist, bak)
-    if rewrite(hist):
-        print("  history.jsonl updated (backup kept)")
-    else:
-        bak.unlink()
-
-# ~/.claude.json: per-project trust / allowed tools / MCP servers
-cfg = Path.home() / ".claude.json"
-if cfg.is_file():
-    data = json.loads(cfg.read_text())
-    projects = data.get("projects", {})
-    if old in projects:
-        shutil.copy2(cfg, cfg.with_name(f".claude.json.bak-{stamp}"))
-        entry = projects.pop(old)
-        if new in projects:
-            entry.update(projects[new])   # existing destination entry wins
-        projects[new] = entry
-        cfg.write_text(json.dumps(data, indent=2))
-        print("  ~/.claude.json project entry moved (backup kept)")
-    elif new in projects:
-        print("  ~/.claude.json project entry already at new path")
-PYEOF
+echo "Updating references..."
+refs apply
 
 echo ""
 echo "Done: $OLD_ABS -> $NEW_ABS"
+[ "$COWORK_REFS" -gt 0 ] && echo "Note: old Cowork sessions may show one folder-consent prompt on next use."
+exit 0
