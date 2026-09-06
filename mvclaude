@@ -1,0 +1,197 @@
+#!/bin/bash
+set -e
+
+# mvclaude — move a project directory AND its Claude Code (CLI) context with it.
+#
+# Usage: mvclaude <old_directory> <new_directory>
+#
+# What Claude Code keys off the project path:
+#   ~/.claude/projects/<encoded-path>/   session transcripts (*.jsonl)
+#   ~/.claude.json  -> "projects" object keyed by the ABSOLUTE path
+#                      (trust, allowed tools, per-project MCP servers)
+#   ~/.claude/history.jsonl              global prompt history (contains cwd)
+#
+# Encoding rule (verified in claude v2.1.251):
+#   every non-alphanumeric character becomes "-"   [^a-zA-Z0-9] -> -
+
+if [ $# -ne 2 ]; then
+    echo "Usage: mvclaude <old_directory> <new_directory>"
+    echo "Example: mvclaude ~/old-project ~/new-project"
+    exit 1
+fi
+
+OLD_DIR="$1"
+NEW_DIR="$2"
+CLAUDE_DIR="$HOME/.claude"
+
+# --- Validate everything BEFORE touching anything -----------------------------
+
+# Canonicalize via getcwd(): resolves symlinks AND on-disk case (macOS is
+# case-insensitive; bash "pwd -P" keeps typed case, Claude records the real one).
+OLD_ABS=$(cd "$OLD_DIR" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
+if [ -z "$OLD_ABS" ]; then
+    echo "Error: old directory does not exist: $OLD_DIR"
+    exit 1
+fi
+
+if [ -e "$NEW_DIR" ]; then
+    echo "Error: destination already exists: $NEW_DIR"
+    exit 1
+fi
+
+case "$NEW_DIR" in
+    /*) NEW_PARENT=$(dirname "$NEW_DIR") ;;
+    *)  NEW_PARENT=$(dirname "./$NEW_DIR") ;;
+esac
+NEW_PARENT_ABS=$(cd "$NEW_PARENT" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
+if [ -z "$NEW_PARENT_ABS" ]; then
+    echo "Error: parent of destination does not exist: $NEW_PARENT"
+    exit 1
+fi
+NEW_ABS="$NEW_PARENT_ABS/$(basename "$NEW_DIR")"
+
+# Correct encoding: ALL non-alphanumerics -> "-" (not just "/" and ".")
+encode() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+OLD_ENCODED=$(encode "$OLD_ABS")
+NEW_ENCODED=$(encode "$NEW_ABS")
+
+# Claude truncates encodings > 200 chars and appends a hash; not handled here.
+if [ ${#OLD_ENCODED} -gt 200 ] || [ ${#NEW_ENCODED} -gt 200 ]; then
+    echo "Error: encoded path exceeds 200 chars; Claude hash-truncates these. Aborting."
+    exit 1
+fi
+
+# --- Check for existing context at the destination ----------------------------
+
+SUBDIRS="projects file-history todos shell-snapshots debug"
+
+EXISTING_CONTEXT=""
+for subdir in $SUBDIRS; do
+    NEW_PATH="$CLAUDE_DIR/$subdir/$NEW_ENCODED"
+    if [ -e "$NEW_PATH" ]; then
+        EXISTING_CONTEXT="$EXISTING_CONTEXT $subdir"
+    fi
+done
+
+if [ -n "$EXISTING_CONTEXT" ]; then
+    echo "Warning: Claude context already exists for $NEW_ABS:"
+    for item in $EXISTING_CONTEXT; do
+        COUNT=""
+        if [ "$item" = "projects" ] && [ -d "$CLAUDE_DIR/$item/$NEW_ENCODED" ]; then
+            SESSION_COUNT=$(find "$CLAUDE_DIR/$item/$NEW_ENCODED" -maxdepth 1 -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+            COUNT=" ($SESSION_COUNT sessions)"
+        fi
+        echo "  - $item$COUNT"
+    done
+    echo ""
+    echo "Options:"
+    echo "  [c] Clean out existing context and continue"
+    echo "  [m] Merge old context into existing context"
+    echo "  [n] Abort (default)"
+    echo ""
+    read -p "Choose [c/m/N]: " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Cc]$ ]]; then
+        for item in $EXISTING_CONTEXT; do
+            rm -rf "$CLAUDE_DIR/$item/$NEW_ENCODED"
+            echo "  removed $item"
+        done
+    elif [[ $REPLY =~ ^[Mm]$ ]]; then
+        echo "Will merge contexts..."
+    else
+        echo "Aborted."
+        exit 1
+    fi
+    echo ""
+fi
+
+# --- 1. Move the real directory FIRST (most likely thing to fail) -------------
+
+echo "Moving directory:"
+echo "  $OLD_ABS"
+echo "  -> $NEW_ABS"
+mv "$OLD_ABS" "$NEW_ABS"
+echo ""
+
+# --- 2. Move / merge the context directories ----------------------------------
+
+MOVED=0
+for subdir in $SUBDIRS; do
+    OLD_PATH="$CLAUDE_DIR/$subdir/$OLD_ENCODED"
+    NEW_PATH="$CLAUDE_DIR/$subdir/$NEW_ENCODED"
+    if [ -d "$OLD_PATH" ]; then
+        if [ -d "$NEW_PATH" ]; then
+            echo "Merging $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
+            # find, not glob: also moves dotfiles
+            find "$OLD_PATH" -mindepth 1 -maxdepth 1 -exec mv {} "$NEW_PATH/" \;
+            rmdir "$OLD_PATH" 2>/dev/null || rm -rf "$OLD_PATH"
+        else
+            echo "Moving $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
+            mv "$OLD_PATH" "$NEW_PATH"
+        fi
+        MOVED=$((MOVED + 1))
+    elif [ -f "$OLD_PATH" ]; then
+        echo "Moving $subdir/$OLD_ENCODED -> $subdir/$NEW_ENCODED"
+        mv "$OLD_PATH" "$NEW_PATH"
+        MOVED=$((MOVED + 1))
+    fi
+done
+
+if [ "$MOVED" -eq 0 ]; then
+    echo "No Claude context found for $OLD_ABS"
+else
+    echo "Moved $MOVED context location(s)"
+fi
+echo ""
+
+# --- 3. Rewrite path references (python: safe with any characters) ------------
+# Replaces OLD_ABS only when NOT followed by [A-Za-z0-9_.-], so moving
+# /a/b never rewrites /a/b2, /a/b_x, or /a/b.bak ( /a/b/sub still matches ).
+
+echo "Updating path references..."
+python3 - "$OLD_ABS" "$NEW_ABS" "$CLAUDE_DIR" "$NEW_ENCODED" <<'PYEOF'
+import json, re, shutil, sys, time
+from pathlib import Path
+
+old, new, claude_dir, new_encoded = sys.argv[1:5]
+claude_dir = Path(claude_dir)
+stamp = time.strftime("%Y%m%d-%H%M%S")
+pat = re.compile(re.escape(old) + r'(?![A-Za-z0-9_.-])')
+
+def rewrite(p):
+    s = p.read_text(errors="surrogateescape")
+    s2 = pat.sub(lambda m: new, s)
+    if s2 != s:
+        p.write_text(s2, errors="surrogateescape")
+        return 1
+    return 0
+
+# Session transcripts
+proj = claude_dir / "projects" / new_encoded
+n = sum(rewrite(f) for f in proj.rglob("*.jsonl")) if proj.is_dir() else 0
+print(f"  session files updated: {n}")
+
+# Global history
+hist = claude_dir / "history.jsonl"
+if hist.is_file():
+    shutil.copy2(hist, hist.with_name(f"history.jsonl.bak-{stamp}"))
+    if rewrite(hist):
+        print("  history.jsonl updated (backup kept)")
+
+# ~/.claude.json: per-project trust / allowed tools / MCP servers
+cfg = Path.home() / ".claude.json"
+if cfg.is_file():
+    data = json.loads(cfg.read_text())
+    projects = data.get("projects", {})
+    if old in projects:
+        shutil.copy2(cfg, cfg.with_name(f".claude.json.bak-{stamp}"))
+        entry = projects.pop(old)
+        if new in projects:
+            entry.update(projects[new])   # existing destination entry wins
+        projects[new] = entry
+        cfg.write_text(json.dumps(data, indent=2))
+        print("  ~/.claude.json project entry moved (backup kept)")
+PYEOF
+
+echo ""
+echo "Done: $OLD_ABS -> $NEW_ABS"

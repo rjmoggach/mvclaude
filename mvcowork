@@ -1,0 +1,140 @@
+#!/bin/bash
+set -e
+
+# mvcowork — move a folder AND update every Cowork (Claude desktop app)
+# reference to it.
+#
+# Usage:
+#   mvcowork <old_folder> <new_folder>              move + rewrite references
+#   mvcowork --refs-only <old_abs> <new_abs>        rewrite references only
+#                                                   (folder already moved,
+#                                                    e.g. by mvclaude)
+#
+# What it rewrites (plain-JSON path references, verified on disk):
+#   local-agent-mode-sessions/<org>/<user>/local_<id>.json   userSelectedFolders
+#   local-agent-mode-sessions/<org>/<user>/spaces.json(.bak) spaces[].folders[].path
+#   local-agent-mode-sessions/<org>/<user>/remote-session-spaces.json
+#   claude_desktop_config.json                               folder consent grants
+#
+# NOT touched (history/caches; stale entries are harmless):
+#   session transcripts, audit logs, IndexedDB, vm_bundles.
+#
+# Backups of every changed file go to ~/.mvcowork-backups/<timestamp>/
+
+APP="${MVCOWORK_APP_DIR:-$HOME/Library/Application Support/Claude}"
+
+REFS_ONLY=0
+if [ "$1" = "--refs-only" ]; then
+    REFS_ONLY=1
+    shift
+fi
+
+if [ $# -ne 2 ]; then
+    echo "Usage: mvcowork [--refs-only] <old_folder> <new_folder>"
+    exit 1
+fi
+
+OLD_DIR="$1"
+NEW_DIR="$2"
+
+# The Claude desktop app must be closed, or it rewrites these files under us.
+if pgrep -xq "Claude" 2>/dev/null; then
+    echo "Error: quit the Claude desktop app first."
+    exit 1
+fi
+
+if [ ! -d "$APP/local-agent-mode-sessions" ]; then
+    echo "Error: Cowork data not found at: $APP"
+    exit 1
+fi
+
+if [ "$REFS_ONLY" -eq 1 ]; then
+    # Folder already moved. Both paths must be absolute; new must exist
+    # unless MVCOWORK_SKIP_FS_CHECKS=1 (testing).
+    case "$OLD_DIR" in /*) ;; *) echo "Error: --refs-only needs absolute paths."; exit 1 ;; esac
+    case "$NEW_DIR" in /*) ;; *) echo "Error: --refs-only needs absolute paths."; exit 1 ;; esac
+    OLD_ABS="${OLD_DIR%/}"
+    NEW_ABS="${NEW_DIR%/}"
+    if [ "${MVCOWORK_SKIP_FS_CHECKS:-0}" != "1" ]; then
+        if [ ! -d "$NEW_ABS" ]; then
+            echo "Error: new folder does not exist: $NEW_ABS"
+            exit 1
+        fi
+        NEW_ABS=$(cd "$NEW_ABS" && python3 -c 'import os; print(os.getcwd())')   # resolve symlinks + case
+    fi
+else
+    # Canonicalize via getcwd(): resolves symlinks and on-disk case.
+    OLD_ABS=$(cd "$OLD_DIR" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
+    if [ -z "$OLD_ABS" ]; then
+        echo "Error: old folder does not exist: $OLD_DIR"
+        echo "(already moved it? use: mvcowork --refs-only <old_abs> <new_abs>)"
+        exit 1
+    fi
+    if [ -e "$NEW_DIR" ]; then
+        echo "Error: destination already exists: $NEW_DIR"
+        exit 1
+    fi
+    case "$NEW_DIR" in
+        /*) NEW_PARENT=$(dirname "$NEW_DIR") ;;
+        *)  NEW_PARENT=$(dirname "./$NEW_DIR") ;;
+    esac
+    NEW_PARENT_ABS=$(cd "$NEW_PARENT" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
+    if [ -z "$NEW_PARENT_ABS" ]; then
+        echo "Error: parent of destination does not exist: $NEW_PARENT"
+        exit 1
+    fi
+    NEW_ABS="$NEW_PARENT_ABS/$(basename "$NEW_DIR")"
+
+    echo "Moving folder:"
+    echo "  $OLD_ABS"
+    echo "  -> $NEW_ABS"
+    mv "$OLD_ABS" "$NEW_ABS"
+    echo ""
+fi
+
+echo "Updating Cowork references..."
+python3 - "$OLD_ABS" "$NEW_ABS" "$APP" <<'PYEOF'
+import re, shutil, sys, time
+from pathlib import Path
+
+old, new, app = sys.argv[1:4]
+app = Path(app)
+stamp = time.strftime("%Y%m%d-%H%M%S")
+backup_root = Path.home() / ".mvcowork-backups" / stamp
+
+# Replace old path only when NOT followed by [A-Za-z0-9_.-], so moving
+# /a/b never rewrites /a/b2, /a/b_x, or /a/b.bak ( /a/b/sub still matches ).
+pat = re.compile(re.escape(old) + r'(?![A-Za-z0-9_.-])')
+
+targets = [app / "claude_desktop_config.json"]
+lam = app / "local-agent-mode-sessions"
+for user_dir in lam.glob("*/*"):
+    if not user_dir.is_dir():
+        continue
+    targets += sorted(user_dir.glob("local_*.json"))
+    for name in ("spaces.json", "spaces.json.bak", "remote-session-spaces.json"):
+        targets.append(user_dir / name)
+
+changed = 0
+for f in targets:
+    if not f.is_file():
+        continue
+    s = f.read_text(errors="surrogateescape")
+    s2 = pat.sub(lambda m: new, s)
+    if s2 != s:
+        bak = backup_root / f.relative_to(app)
+        bak.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, bak)
+        f.write_text(s2, errors="surrogateescape")
+        changed += 1
+        print(f"  updated {f.relative_to(app)}")
+
+if changed:
+    print(f"  {changed} file(s) updated; backups in {backup_root}")
+else:
+    print("  no Cowork references found for that path")
+PYEOF
+
+echo ""
+echo "Done: $OLD_ABS -> $NEW_ABS"
+echo "Note: old sessions may show one folder-consent prompt on next use."
