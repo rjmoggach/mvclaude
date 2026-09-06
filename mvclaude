@@ -3,7 +3,15 @@ set -e
 
 # mvclaude — move a project directory AND its Claude Code (CLI) context with it.
 #
-# Usage: mvclaude <old_directory> <new_directory>
+# Usage:
+#   mvclaude <old_directory> <new_directory>
+#   mvclaude --resume <old_directory> <new_directory>
+#
+# --resume finishes a move that stopped part way (for example a cross-volume
+# copy whose source could not be deleted). It copies whatever is still in
+# <old> into <new>, removes <old>, then moves the Claude context and rewrites
+# references. If <old> is already gone it only does the context/reference part.
+# Every step is idempotent, so re-running --resume is always safe.
 #
 # What Claude Code keys off the project path:
 #   ~/.claude/projects/<encoded-path>/   session transcripts (*.jsonl)
@@ -13,45 +21,144 @@ set -e
 #
 # Encoding rule (verified in claude v2.1.251):
 #   every non-alphanumeric character becomes "-"   [^a-zA-Z0-9] -> -
+#
+# Cross-volume moves: BSD `mv` copies, then `rm -rf`s the source, and fails
+# with "Directory not empty" when Finder/Spotlight drop a .DS_Store into the
+# source during the copy. We use `rsync --remove-source-files` instead, then
+# sweep junk files and empty directories. Hard links are preserved (-H).
+# macOS extended attributes are not (openrsync's -E is unreliable).
 
-if [ $# -ne 2 ]; then
-    echo "Usage: mvclaude <old_directory> <new_directory>"
+usage() {
+    echo "Usage: mvclaude [--resume] <old_directory> <new_directory>"
     echo "Example: mvclaude ~/old-project ~/new-project"
+    echo "         mvclaude --resume ~/old-project ~/new-project   # finish a partial move"
     exit 1
-fi
+}
+
+RESUME=0
+case "$1" in
+    --resume|--refs-only) RESUME=1; shift ;;
+    --*) usage ;;
+esac
+[ $# -eq 2 ] || usage
 
 OLD_DIR="$1"
 NEW_DIR="$2"
 CLAUDE_DIR="$HOME/.claude"
 
-# --- Validate everything BEFORE touching anything -----------------------------
+# --- Helpers ------------------------------------------------------------------
 
 # Canonicalize via getcwd(): resolves symlinks AND on-disk case (macOS is
 # case-insensitive; bash "pwd -P" keeps typed case, Claude records the real one).
-OLD_ABS=$(cd "$OLD_DIR" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
-if [ -z "$OLD_ABS" ]; then
-    echo "Error: old directory does not exist: $OLD_DIR"
-    exit 1
-fi
-
-if [ -e "$NEW_DIR" ]; then
-    echo "Error: destination already exists: $NEW_DIR"
-    exit 1
-fi
-
-case "$NEW_DIR" in
-    /*) NEW_PARENT=$(dirname "$NEW_DIR") ;;
-    *)  NEW_PARENT=$(dirname "./$NEW_DIR") ;;
-esac
-NEW_PARENT_ABS=$(cd "$NEW_PARENT" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
-if [ -z "$NEW_PARENT_ABS" ]; then
-    echo "Error: parent of destination does not exist: $NEW_PARENT"
-    exit 1
-fi
-NEW_ABS="$NEW_PARENT_ABS/$(basename "$NEW_DIR")"
+canon()   { (cd "$1" 2>/dev/null && python3 -c 'import os; print(os.getcwd())'); }
+abspath() { python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+same_device() { [ "$(stat -f %d "$1")" = "$(stat -f %d "$2")" ]; }
 
 # Correct encoding: ALL non-alphanumerics -> "-" (not just "/" and ".")
 encode() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
+
+# Delete junk files and empty dirs left in a copied-out source tree.
+# Fails (listing leftovers) if anything real remains.
+sweep_source() {
+    local src="$1"
+    [ -e "$src" ] || return 0
+    find "$src" -type f -name .DS_Store -delete
+    find "$src" -depth -type d -empty -delete
+    if [ -e "$src" ]; then
+        echo "Error: source still has content that was not moved:"
+        find "$src" -mindepth 1 -not -type d | head -20
+        echo "Fix the above (permissions? files still open?) then re-run with --resume."
+        return 1
+    fi
+}
+
+# Move a directory tree. Same volume + fresh destination: atomic rename.
+# Otherwise: rsync copy that removes each source file once it is safely
+# written, then sweep. Interrupt-safe: re-run to continue where it stopped.
+move_tree() {
+    local src="$1" dst="$2"
+    if [ ! -e "$dst" ] && same_device "$src" "$(dirname "$dst")"; then
+        mv "$src" "$dst"
+        return
+    fi
+    echo "  (different volume or resuming: copying with rsync)"
+    rsync -aH --remove-source-files "$src/" "$dst/"
+    sweep_source "$src"
+}
+
+# --- Validate everything BEFORE touching anything -----------------------------
+
+OLD_EXISTS=0
+if [ -d "$OLD_DIR" ]; then
+    OLD_ABS=$(canon "$OLD_DIR")
+    OLD_EXISTS=1
+elif [ "$RESUME" -eq 1 ]; then
+    OLD_ABS=$(abspath "$OLD_DIR")
+else
+    echo "Error: old directory does not exist: $OLD_DIR"
+    echo "(already moved it? use: mvclaude --resume <old> <new>)"
+    exit 1
+fi
+
+NEW_EXISTS=0
+if [ -e "$NEW_DIR" ]; then
+    if [ "$RESUME" -ne 1 ]; then
+        echo "Error: destination already exists: $NEW_DIR"
+        echo "(did a previous move stop part way? use: mvclaude --resume <old> <new>)"
+        exit 1
+    fi
+    if [ ! -d "$NEW_DIR" ]; then
+        echo "Error: destination exists and is not a directory: $NEW_DIR"
+        exit 1
+    fi
+    NEW_ABS=$(canon "$NEW_DIR")
+    NEW_EXISTS=1
+else
+    case "$NEW_DIR" in
+        /*) NEW_PARENT=$(dirname "$NEW_DIR") ;;
+        *)  NEW_PARENT=$(dirname "./$NEW_DIR") ;;
+    esac
+    NEW_PARENT_ABS=$(canon "$NEW_PARENT" || true)
+    if [ -z "$NEW_PARENT_ABS" ]; then
+        echo "Error: parent of destination does not exist: $NEW_PARENT"
+        exit 1
+    fi
+    NEW_ABS="$NEW_PARENT_ABS/$(basename "$NEW_DIR")"
+fi
+
+if [ "$OLD_EXISTS" -eq 0 ] && [ "$NEW_EXISTS" -eq 0 ]; then
+    echo "Error: neither old nor new directory exists; nothing to resume."
+    exit 1
+fi
+if [ "$OLD_ABS" = "$NEW_ABS" ]; then
+    echo "Error: old and new resolve to the same directory: $OLD_ABS"
+    exit 1
+fi
+case "$NEW_ABS/" in
+    "$OLD_ABS"/*) echo "Error: destination is inside the source: $NEW_ABS"; exit 1 ;;
+esac
+
+# Old dir already gone: we cannot read its on-disk case, so recover the exact
+# path string Claude recorded from ~/.claude.json (case-insensitive match).
+if [ "$OLD_EXISTS" -eq 0 ]; then
+    RECORDED=$(python3 - "$OLD_ABS" <<'PYEOF'
+import json, sys
+from pathlib import Path
+old = sys.argv[1]
+try:
+    keys = json.loads((Path.home() / ".claude.json").read_text()).get("projects", {})
+except Exception:
+    keys = {}
+hits = [k for k in keys if k.lower() == old.lower()]
+print(hits[0] if len(hits) == 1 else old)
+PYEOF
+)
+    if [ "$RECORDED" != "$OLD_ABS" ]; then
+        echo "Note: using path as recorded by Claude: $RECORDED"
+        OLD_ABS="$RECORDED"
+    fi
+fi
+
 OLD_ENCODED=$(encode "$OLD_ABS")
 NEW_ENCODED=$(encode "$NEW_ABS")
 
@@ -61,14 +168,14 @@ if [ ${#OLD_ENCODED} -gt 200 ] || [ ${#NEW_ENCODED} -gt 200 ]; then
     exit 1
 fi
 
-# --- Check for existing context at the destination ----------------------------
+# --- Check for context conflicts at the destination --------------------------
+# Only a conflict when BOTH old and new context exist for the same subdir.
 
 SUBDIRS="projects file-history todos shell-snapshots debug"
 
 EXISTING_CONTEXT=""
 for subdir in $SUBDIRS; do
-    NEW_PATH="$CLAUDE_DIR/$subdir/$NEW_ENCODED"
-    if [ -e "$NEW_PATH" ]; then
+    if [ -e "$CLAUDE_DIR/$subdir/$OLD_ENCODED" ] && [ -e "$CLAUDE_DIR/$subdir/$NEW_ENCODED" ]; then
         EXISTING_CONTEXT="$EXISTING_CONTEXT $subdir"
     fi
 done
@@ -107,10 +214,18 @@ fi
 
 # --- 1. Move the real directory FIRST (most likely thing to fail) -------------
 
-echo "Moving directory:"
-echo "  $OLD_ABS"
-echo "  -> $NEW_ABS"
-mv "$OLD_ABS" "$NEW_ABS"
+if [ "$OLD_EXISTS" -eq 1 ]; then
+    if [ "$NEW_EXISTS" -eq 1 ]; then
+        echo "Resuming move (copying what is still in the old directory):"
+    else
+        echo "Moving directory:"
+    fi
+    echo "  $OLD_ABS"
+    echo "  -> $NEW_ABS"
+    move_tree "$OLD_ABS" "$NEW_ABS"
+else
+    echo "Directory already moved; updating Claude context and references only."
+fi
 echo ""
 
 # --- 2. Move / merge the context directories ----------------------------------
@@ -147,6 +262,7 @@ echo ""
 # --- 3. Rewrite path references (python: safe with any characters) ------------
 # Replaces OLD_ABS only when NOT followed by [A-Za-z0-9_.-], so moving
 # /a/b never rewrites /a/b2, /a/b_x, or /a/b.bak ( /a/b/sub still matches ).
+# Idempotent: a second run finds nothing to change.
 
 echo "Updating path references..."
 python3 - "$OLD_ABS" "$NEW_ABS" "$CLAUDE_DIR" "$NEW_ENCODED" <<'PYEOF'
@@ -174,9 +290,12 @@ print(f"  session files updated: {n}")
 # Global history
 hist = claude_dir / "history.jsonl"
 if hist.is_file():
-    shutil.copy2(hist, hist.with_name(f"history.jsonl.bak-{stamp}"))
+    bak = hist.with_name(f"history.jsonl.bak-{stamp}")
+    shutil.copy2(hist, bak)
     if rewrite(hist):
         print("  history.jsonl updated (backup kept)")
+    else:
+        bak.unlink()
 
 # ~/.claude.json: per-project trust / allowed tools / MCP servers
 cfg = Path.home() / ".claude.json"
@@ -191,6 +310,8 @@ if cfg.is_file():
         projects[new] = entry
         cfg.write_text(json.dumps(data, indent=2))
         print("  ~/.claude.json project entry moved (backup kept)")
+    elif new in projects:
+        print("  ~/.claude.json project entry already at new path")
 PYEOF
 
 echo ""

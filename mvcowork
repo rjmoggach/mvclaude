@@ -6,9 +6,11 @@ set -e
 #
 # Usage:
 #   mvcowork <old_folder> <new_folder>              move + rewrite references
-#   mvcowork --refs-only <old_abs> <new_abs>        rewrite references only
-#                                                   (folder already moved,
-#                                                    e.g. by mvclaude)
+#   mvcowork --resume <old_folder> <new_folder>     finish a partial move, or
+#                                                   rewrite references only if
+#                                                   the folder is already moved
+#                                                   (e.g. by mvclaude)
+#   (--refs-only is accepted as an alias of --resume)
 #
 # What it rewrites (plain-JSON path references, verified on disk):
 #   local-agent-mode-sessions/<org>/<user>/local_<id>.json   userSelectedFolders
@@ -20,22 +22,61 @@ set -e
 #   session transcripts, audit logs, IndexedDB, vm_bundles.
 #
 # Backups of every changed file go to ~/.mvcowork-backups/<timestamp>/
+#
+# Cross-volume moves: BSD `mv` copies, then `rm -rf`s the source, and fails
+# with "Directory not empty" when Finder/Spotlight drop a .DS_Store into the
+# source during the copy. We use `rsync --remove-source-files` instead, then
+# sweep junk files and empty directories. Hard links are preserved (-H).
+# macOS extended attributes are not (openrsync's -E is unreliable).
 
 APP="${MVCOWORK_APP_DIR:-$HOME/Library/Application Support/Claude}"
 
-REFS_ONLY=0
-if [ "$1" = "--refs-only" ]; then
-    REFS_ONLY=1
-    shift
-fi
-
-if [ $# -ne 2 ]; then
-    echo "Usage: mvcowork [--refs-only] <old_folder> <new_folder>"
+usage() {
+    echo "Usage: mvcowork [--resume] <old_folder> <new_folder>"
     exit 1
-fi
+}
+
+RESUME=0
+case "$1" in
+    --resume|--refs-only) RESUME=1; shift ;;
+    --*) usage ;;
+esac
+[ $# -eq 2 ] || usage
 
 OLD_DIR="$1"
 NEW_DIR="$2"
+
+# --- Helpers ------------------------------------------------------------------
+
+canon()   { (cd "$1" 2>/dev/null && python3 -c 'import os; print(os.getcwd())'); }
+abspath() { python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+same_device() { [ "$(stat -f %d "$1")" = "$(stat -f %d "$2")" ]; }
+
+sweep_source() {
+    local src="$1"
+    [ -e "$src" ] || return 0
+    find "$src" -type f -name .DS_Store -delete
+    find "$src" -depth -type d -empty -delete
+    if [ -e "$src" ]; then
+        echo "Error: source still has content that was not moved:"
+        find "$src" -mindepth 1 -not -type d | head -20
+        echo "Fix the above (permissions? files still open?) then re-run with --resume."
+        return 1
+    fi
+}
+
+move_tree() {
+    local src="$1" dst="$2"
+    if [ ! -e "$dst" ] && same_device "$src" "$(dirname "$dst")"; then
+        mv "$src" "$dst"
+        return
+    fi
+    echo "  (different volume or resuming: copying with rsync)"
+    rsync -aH --remove-source-files "$src/" "$dst/"
+    sweep_source "$src"
+}
+
+# --- Validate everything BEFORE touching anything -----------------------------
 
 # The Claude desktop app must be closed, or it rewrites these files under us.
 if pgrep -xq "Claude" 2>/dev/null; then
@@ -48,49 +89,75 @@ if [ ! -d "$APP/local-agent-mode-sessions" ]; then
     exit 1
 fi
 
-if [ "$REFS_ONLY" -eq 1 ]; then
-    # Folder already moved. Both paths must be absolute; new must exist
-    # unless MVCOWORK_SKIP_FS_CHECKS=1 (testing).
-    case "$OLD_DIR" in /*) ;; *) echo "Error: --refs-only needs absolute paths."; exit 1 ;; esac
-    case "$NEW_DIR" in /*) ;; *) echo "Error: --refs-only needs absolute paths."; exit 1 ;; esac
-    OLD_ABS="${OLD_DIR%/}"
-    NEW_ABS="${NEW_DIR%/}"
-    if [ "${MVCOWORK_SKIP_FS_CHECKS:-0}" != "1" ]; then
-        if [ ! -d "$NEW_ABS" ]; then
-            echo "Error: new folder does not exist: $NEW_ABS"
-            exit 1
-        fi
-        NEW_ABS=$(cd "$NEW_ABS" && python3 -c 'import os; print(os.getcwd())')   # resolve symlinks + case
-    fi
+OLD_EXISTS=0
+if [ -d "$OLD_DIR" ]; then
+    OLD_ABS=$(canon "$OLD_DIR")
+    OLD_EXISTS=1
+elif [ "$RESUME" -eq 1 ]; then
+    OLD_ABS=$(abspath "$OLD_DIR")
 else
-    # Canonicalize via getcwd(): resolves symlinks and on-disk case.
-    OLD_ABS=$(cd "$OLD_DIR" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
-    if [ -z "$OLD_ABS" ]; then
-        echo "Error: old folder does not exist: $OLD_DIR"
-        echo "(already moved it? use: mvcowork --refs-only <old_abs> <new_abs>)"
-        exit 1
-    fi
-    if [ -e "$NEW_DIR" ]; then
+    echo "Error: old folder does not exist: $OLD_DIR"
+    echo "(already moved it? use: mvcowork --resume <old> <new>)"
+    exit 1
+fi
+
+NEW_EXISTS=0
+if [ -e "$NEW_DIR" ]; then
+    if [ "$RESUME" -ne 1 ]; then
         echo "Error: destination already exists: $NEW_DIR"
+        echo "(did a previous move stop part way? use: mvcowork --resume <old> <new>)"
         exit 1
     fi
+    if [ ! -d "$NEW_DIR" ]; then
+        echo "Error: destination exists and is not a directory: $NEW_DIR"
+        exit 1
+    fi
+    NEW_ABS=$(canon "$NEW_DIR")
+    NEW_EXISTS=1
+else
     case "$NEW_DIR" in
         /*) NEW_PARENT=$(dirname "$NEW_DIR") ;;
         *)  NEW_PARENT=$(dirname "./$NEW_DIR") ;;
     esac
-    NEW_PARENT_ABS=$(cd "$NEW_PARENT" 2>/dev/null && python3 -c 'import os; print(os.getcwd())' || true)
+    NEW_PARENT_ABS=$(canon "$NEW_PARENT" || true)
     if [ -z "$NEW_PARENT_ABS" ]; then
         echo "Error: parent of destination does not exist: $NEW_PARENT"
         exit 1
     fi
     NEW_ABS="$NEW_PARENT_ABS/$(basename "$NEW_DIR")"
+fi
 
-    echo "Moving folder:"
+if [ "$OLD_EXISTS" -eq 0 ] && [ "$NEW_EXISTS" -eq 0 ]; then
+    if [ "${MVCOWORK_SKIP_FS_CHECKS:-0}" != "1" ]; then
+        echo "Error: neither old nor new folder exists; nothing to resume."
+        exit 1
+    fi
+fi
+if [ "$OLD_ABS" = "$NEW_ABS" ]; then
+    echo "Error: old and new resolve to the same folder: $OLD_ABS"
+    exit 1
+fi
+case "$NEW_ABS/" in
+    "$OLD_ABS"/*) echo "Error: destination is inside the source: $NEW_ABS"; exit 1 ;;
+esac
+
+# --- 1. Move the folder -------------------------------------------------------
+
+if [ "$OLD_EXISTS" -eq 1 ]; then
+    if [ "$NEW_EXISTS" -eq 1 ]; then
+        echo "Resuming move (copying what is still in the old folder):"
+    else
+        echo "Moving folder:"
+    fi
     echo "  $OLD_ABS"
     echo "  -> $NEW_ABS"
-    mv "$OLD_ABS" "$NEW_ABS"
-    echo ""
+    move_tree "$OLD_ABS" "$NEW_ABS"
+else
+    echo "Folder already moved; updating Cowork references only."
 fi
+echo ""
+
+# --- 2. Rewrite references ----------------------------------------------------
 
 echo "Updating Cowork references..."
 python3 - "$OLD_ABS" "$NEW_ABS" "$APP" <<'PYEOF'
