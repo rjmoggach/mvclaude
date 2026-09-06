@@ -18,8 +18,13 @@ set -e
 #
 # Every step is idempotent: re-running after a failure is always safe.
 #
-#   -y / --yes   do not ask before continuing into an existing destination
-#                that does not obviously look like a partial move
+#   -y, --yes    answer yes to both prompts, for scripted or non-interactive
+#                runs:
+#                  * destination exists but does not look like a partial copy
+#                    of the source -> merge old into it anyway
+#                  * Claude context already exists at the new path
+#                    -> merge old context into it (never deletes it)
+#                Without -y a terminal run asks; a non-interactive run aborts.
 #
 # Claude Code path encoding (verified in claude v2.1.251):
 #   every non-alphanumeric character becomes "-"   [^a-zA-Z0-9] -> -
@@ -35,6 +40,16 @@ set -e
 
 usage() {
     echo "Usage: mvclaude [-y] <old_directory> <new_directory>"
+    echo ""
+    echo "Moves the folder (or finishes a partial move) and updates every"
+    echo "Claude Code and Cowork reference to it. Detects what is needed;"
+    echo "safe to re-run."
+    echo ""
+    echo "  -y, --yes   answer yes to prompts: merge into an existing destination"
+    echo "              that does not look like a partial copy, and merge into"
+    echo "              Claude context that already exists at the new path."
+    echo "              Without -y a terminal run asks; a non-interactive run aborts."
+    echo ""
     echo "Example: mvclaude ~/old-project ~/new-project"
     exit 1
 }
